@@ -193,8 +193,39 @@ function pickVariety() {
 }
 
 // ─── life ───────────────────────────────────────────────────────────────────
-/** Add one koi; `offscreen` starts it just outside the edge, heading in. */
-function spawn(pond, species, { young = false, offscreen = false } = {}) {
+/**
+ * A title has to fit in one grid cell per character, and the grid stores a single
+ * UTF-16 unit. Drop emoji and other non-BMP characters, and collapse blank runs,
+ * so a bad string can't paint a broken glyph. Empty means "no title".
+ */
+function cleanTitle(value) {
+  if (value == null) return "";
+  const text = typeof value === "string" ? value : String(value);
+  let out = "";
+  for (const ch of text.trim()) {
+    const cp = ch.codePointAt(0);
+    if (cp === 32) out += " ";
+    else if (cp > 32 && cp <= 0xffff) out += ch;
+  }
+  return out.replace(/ +/g, " ").trim();
+}
+
+/**
+ * Adults take the next string from `config.titles`, in spawn order. Young koi are
+ * too small to read, so they never consume a slot. Past the end of the list every
+ * koi is untitled, which is what keeps the feature opt-in.
+ */
+function takeTitle(species, config, young) {
+  const titles = config.titles;
+  if (young || !Array.isArray(titles) || titles.length === 0) return "";
+  const i = species.titleCursor || 0;
+  if (i >= titles.length) return "";
+  species.titleCursor = i + 1;
+  return cleanTitle(titles[i]);
+}
+
+/** Add one koi; `offscreen` starts it just outside the edge, heading in. `title` is drawn along the spine. */
+function spawn(pond, species, { young = false, offscreen = false, title = "" } = {}) {
   const W = pond.width, H = pond.height;
   const baseLength = clamp(Math.min(W, H) * 0.5, 170, 420);
   const length = baseLength * (young ? rand(0.32, 0.45) : rand(0.6, 1));
@@ -218,6 +249,7 @@ function spawn(pond, species, { young = false, offscreen = false } = {}) {
     species,
     id: pond.nextId++,
     variety: pickVariety(),
+    title,
     length,
     nodes,
     heading,
@@ -302,7 +334,10 @@ function wanted(pond, { count = "auto", young = "auto" }) {
 
 function seed(pond, species, config) {
   const { adults, juveniles } = wanted(pond, config);
-  for (let i = 0; i < adults + juveniles; i++) spawn(pond, species, { young: i >= adults });
+  for (let i = 0; i < adults + juveniles; i++) {
+    const young = i >= adults;
+    spawn(pond, species, { young, title: takeTitle(species, config, young) });
+  }
 }
 
 /**
@@ -319,7 +354,9 @@ function grow(pond, species, config) {
     const staying = mine.filter((c) => !c.leaving);
     let need = (young ? want.juveniles : want.adults) - staying.length;
     for (const k of mine) if (need > 0 && room > 0 && k.leaving) { k.leaving = false; need--; room--; }
-    for (; need > 0 && room > 0; need--, room--) spawn(pond, species, { young, offscreen: true });
+    for (; need > 0 && room > 0; need--, room--) {
+      spawn(pond, species, { young, offscreen: true, title: takeTitle(species, config, young) });
+    }
     const edge = (k) => Math.min(k.nodes[0], pond.width - k.nodes[0], k.nodes[1], pond.height - k.nodes[1]) + (k.food ? 1e4 : 0);
     staying.sort((a, b) => edge(a) - edge(b));
     for (let i = 0; i < -need; i++) { staying[i].leaving = true; setMood(pond, staying[i], "cruise"); }
@@ -1030,6 +1067,190 @@ function project(k, px, py, from = 0, to = NODES - 2) {
   return hit.inside;
 }
 
+// ── title along the spine ─────────────────────────────────────────────────
+/** Title run, as a fraction of length: behind the mouth, and not out on the thin tail. */
+const TITLE_FROM = 0.15;
+const TITLE_TO = 0.70;
+/** Chord / arc below this means the run has folded; letters would pile up and read backwards. */
+const TITLE_FOLD = 0.72;
+
+/** Point on the render spine at arc length `dist` (pixels from the snout). */
+function spinePoint(k, dist) {
+  const { arc, spine } = k;
+  let n = 1;
+  const last = arc.length - 1;
+  while (n < last && arc[n] < dist) n++;
+  const span = arc[n] - arc[n - 1] || 1;
+  const u = clamp((dist - arc[n - 1]) / span, 0, 1);
+  const i = (n - 1) * 2;
+  return {
+    x: spine[i] + (spine[i + 2] - spine[i]) * u,
+    y: spine[i + 1] + (spine[i + 3] - spine[i + 1]) * u,
+  };
+}
+
+/**
+ * How far back the name may go on this fish. The tail stalk gets thinner than a
+ * cell, and a letter there would sit on a fringe dot instead of on the body.
+ */
+function titleEnd(k, cw, ch) {
+  // The cell that holds a spine point has its centre up to half a diagonal away.
+  // Thinner than that, and the letter would land on a fringe cell or off the body.
+  const need = Math.hypot(cw, ch) * 0.5;
+  let s1 = TITLE_FROM;
+  for (let s = TITLE_FROM; s <= TITLE_TO; s += 0.015) {
+    if (halfWidth(s) * k.length < need) break;
+    s1 = s;
+  }
+  return s1;
+}
+
+/**
+ * Grid cells the spine passes through from `a0` to `a1`, snout first. Returns null
+ * when the path can't carry a word: it leaves the screen and comes back, jumps a
+ * cell, or folds onto a cell it already used. A one-cell graze along a boundary
+ * is ignored so the letters don't flicker as the fish crosses a grid line.
+ */
+function titleCells(renderer, k, a0, a1) {
+  const { cellW: cw, cellH: ch, cols, rows, grid } = renderer;
+  const step = Math.min(cw, ch) * 0.45;
+  const cells = [];
+  let prev = -1;
+  let off = false;
+  for (let i = 0; ; i++) {
+    const dist = Math.min(a0 + i * step, a1);
+    const p = spinePoint(k, dist);
+    const c = Math.floor(p.x / cw);
+    const r = Math.floor(p.y / ch);
+    const last = dist === a1;
+    if (c < 0 || r < 0 || c >= cols || r >= rows) {
+      if (cells.length) off = true;
+      prev = -1;
+    } else if (off) {
+      return null;
+    } else {
+      const idx = r * cols + c;
+      const cx = c * cw + cw / 2, cy = r * ch + ch / 2;
+      // A corner clip isn't body at the cell centre. Skip it; the next sample lands cleaner.
+      if (idx !== prev && grid.glyph[idx] && project(k, cx, cy) && hit.flag === F_BODY) {
+        const seen = cells.lastIndexOf(idx);
+        if (seen !== -1 && seen < cells.length - 3) return null;
+        if (seen === -1) {
+          if (prev !== -1) {
+            const dc = Math.abs(c - (prev % cols));
+            const dr = Math.abs(r - ((prev / cols) | 0));
+            if (dc > 2 || dr > 2) return null;
+          }
+          cells.push(idx);
+          prev = idx;
+        }
+      }
+    }
+    if (last) break;
+  }
+  return cells;
+}
+
+/**
+ * Which way the string reads. Glyphs in this engine are always drawn upright —
+ * there is no rotated glyph — so turning each letter onto the tangent would flip
+ * it upside down as soon as the fish faced left. The string is ordered
+ * left-to-right instead, or top-to-bottom when the body is steeper than it is
+ * wide. `dx, dy` is snout-to-tail. The choice sticks until the other axis is
+ * clearly longer, so a turn through the diagonal doesn't swap the word each frame.
+ */
+function titleAcross(dx, dy, prev) {
+  const ax = Math.abs(dx), ay = Math.abs(dy);
+  if (prev == null) return ax >= ay;
+  if (ax > ay * 1.35) return true;
+  if (ay > ax * 1.35) return false;
+  return prev;
+}
+
+/** Ink and a cleared plate, picked so the letter beats the skin and the body glyphs under it. */
+function titleInk(tile, bg) {
+  const src = tile || packRgb(bg);
+  const rgb = [(src >>> 16) & 255, (src >>> 8) & 255, src & 255];
+  const y = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2];
+  const onLight = y > 145;
+  const ink = onLight ? [14, 12, 11] : [255, 252, 248];
+  const plate = onLight ? [255, 252, 248] : [10, 8, 7];
+  return { color: packRgb(ink), tile: packRgb(mix(rgb, plate, 0.72)) };
+}
+
+/**
+ * A diagonal spine walks a staircase: a cell to the side, then a cell down.
+ * Putting a letter on both stacks two glyphs. Keep one cell per column when the
+ * word reads across, or one per row when it reads down, so the letters stay in a line.
+ */
+function titleSlots(cells, cols, across) {
+  const out = [];
+  for (const idx of cells) {
+    if (!out.length) { out.push(idx); continue; }
+    const prev = out[out.length - 1];
+    const dc = Math.abs((idx % cols) - (prev % cols));
+    const dr = Math.abs(((idx / cols) | 0) - ((prev / cols) | 0));
+    if (across ? dc === 0 : dr === 0) continue;
+    out.push(idx);
+  }
+  return out;
+}
+
+/**
+ * Paint `k.title` in the cells along the spine. A koi with no title never calls
+ * this, so its grid cells stay exactly as the body pass left them.
+ * The name is centred on the thick part of the body. A name longer than that run
+ * keeps its leading characters (a trailing scrap of one or two letters is hidden
+ * instead: it wouldn't read as the name). A run that has folded, or a fish too
+ * small to hold three cells of text, draws nothing that frame.
+ */
+function stampTitle(renderer, k) {
+  const title = k.title;
+  const { cellW: cw, cellH: ch, grid, palette: P } = renderer;
+  const s1 = titleEnd(k, cw, ch);
+  if (s1 < TITLE_FROM + 0.05) return;
+
+  const a0 = TITLE_FROM * k.arcTotal;
+  const a1 = s1 * k.arcTotal;
+  const head = spinePoint(k, a0);
+  const tail = spinePoint(k, a1);
+  const dx = tail.x - head.x;
+  const dy = tail.y - head.y;
+  if (Math.hypot(dx, dy) < (a1 - a0) * TITLE_FOLD) return;
+
+  const cells = titleCells(renderer, k, a0, a1);
+  if (!cells || cells.length < 3) return;
+
+  const across = titleAcross(dx, dy, k.titleAcross);
+  const slots = titleSlots(cells, renderer.cols, across);
+  if (slots.length < 3) return;
+  // Snout-to-tail runs right-to-left, or bottom-to-top: reverse so the first
+  // character sits at the left or the top. The letters themselves stay upright.
+  const flip = across ? dx < 0 : dy < 0;
+  const order = flip ? slots.slice().reverse() : slots;
+
+  let text = title;
+  if (text.length > order.length) {
+    if (order.length < 4) return;
+    text = text.slice(0, order.length);
+  }
+  const start = (order.length - text.length) >> 1;
+  const dim = P.alpha * (P.depthFloor + (1 - P.depthFloor) * k.depth);
+  const glyphAlpha = Math.min(1, dim * 1.35);
+
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === " ") continue;
+    const idx = order[start + i];
+    const ink = titleInk(grid.tile[idx], P.bg);
+    grid.tile[idx] = ink.tile;
+    grid.tileAlpha[idx] = Math.max(grid.tileAlpha[idx], dim);
+    grid.glyph[idx] = text.charCodeAt(i);
+    grid.color[idx] = ink.color;
+    grid.alpha[idx] = glyphAlpha;
+  }
+  k.titleAcross = across;
+}
+
 // ── one koi ───────────────────────────────────────────────────────────────
 function draw(renderer, k, t) {
   const { cellW: cw, cellH: ch, cols, rows, grid, palette: P } = renderer;
@@ -1199,6 +1420,7 @@ function draw(renderer, k, t) {
       grid.alpha[i] = alpha;
     }
   }
+  if (k.title) stampTitle(renderer, k);
 }
 
 /** A koi's markings, computed once: they are a property of its id and variety, not its pose. */
@@ -1234,6 +1456,11 @@ function wake(r, k) {
  * The koi species. `count` adults ("auto": 3–6 by pond area), `young` small ones that keep to the
  * deep ("auto": two on wide screens), recounted when the window settles at a new size (adding up
  * to `max`).
+ * `titles` is an optional list of strings, one per adult in the order they spawn. A titled koi
+ * draws that text along its spine; a koi with no title — extras, empty strings, every young koi —
+ * is drawn exactly as before. From script: `{ type: "koi", count: 4, titles: ["ascii-pond"] }`.
+ * On the element, the same list is `titles="ascii-pond|4:18am"` (a pipe, because a comma already
+ * separates species).
  */
 export function koi(config = {}) {
   const species = {
