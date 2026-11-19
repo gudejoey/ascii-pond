@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Titled koi — ascii-pond</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1a1917; color: #fff7f0;
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  p { position: fixed; z-index: 1; left: 24px; bottom: 22px; margin: 0; max-width: 34rem; opacity: .6; }
+</style>
+<script type="module" src="../src/pond.js"></script>
+<body>
+  <!--
+    titles is a koi species option, like count and young. One name per adult, in spawn order.
+    The same list from script:
+      mount(document.body, {
+        theme: "dark",
+        species: [{ type: "koi", count: 4, young: 0,
+          titles: ["ascii-pond", "4:18am", "still water", "cursor"] }],
+      });
+    A pipe separates names here because a comma already separates species.
+  -->
+  <ascii-pond fixed theme="dark" count="4" young="0"
+    titles="ascii-pond|4:18am|still water|cursor"></ascii-pond>
+  <p data-pond-avoid>Each koi carries a project name along its spine. Click the water to feed them.</p>
+</body>

@@ -572,7 +572,7 @@ function textBoxes(selector) {
 
 // ─── mount ──────────────────────────────────────────────────────────────────
 const DEFAULTS = {
-  /** Names from SPECIES, `{ type: "koi", count: 4 }`, or species objects. */
+  /** Names from SPECIES, `{ type: "koi", count: 4, titles: ["ascii-pond"] }`, or species objects. */
   species: ["koi"],
   /** "auto" follows the OS live; "dark" / "light" until setTheme() is called. */
   theme: "auto",
@@ -775,7 +775,7 @@ export function mount(target, options = {}) {
 /** Ponds held by `keep` name until an element takes them back. */
 const kept = new Map();
 /**
- * <ascii-pond species="koi" count="5" young="0" theme="auto|dark|light" avoid="selector" fixed no-feed keep="name">
+ * <ascii-pond species="koi" count="5" young="0" titles="ascii-pond|4:18am" theme="auto|dark|light" avoid="selector" fixed no-feed keep="name">
  * Without `fixed` it fills itself, so give it a size.
  * With `keep`, a pond removed from the page is held under that name, and the next element with the
  * same name carries on with its fish: client-side routing swaps the element out and back in.
@@ -784,9 +784,11 @@ class AsciiPondElement extends HTMLElement {
   connectedCallback() {
     if (this.instance) return;
     const attr = (n) => this.getAttribute(n);
-    // Numbers given here go to every species listed.
+    // Numbers given here go to every species listed. `titles` is a koi option (pipe-separated,
+    // because a comma already separates species); koi.js assigns one string per adult.
     const config = {};
     for (const n of ["count", "young"]) if (this.hasAttribute(n)) config[n] = Number(attr(n));
+    if (this.hasAttribute("titles")) config.titles = (attr("titles") || "").split("|").map((s) => s.trim()).filter(Boolean);
     if (!this.style.display) this.style.display = "block";
     this.instance = mount(this, {
       species: (attr("species") || "koi").split(",").map((type) => ({ type: type.trim(), ...config })),
